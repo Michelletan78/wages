@@ -1,0 +1,163 @@
+---
+title: "Predictive models assignment - ISLR Wage data"
+author: "Michal Staniszewski"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Vignette Title}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ISLR); library(ggplot2); library(plotly); require(cowplot); library(caret); library(corrplot); library(vcd); library(rpart); library(randomForest); library(klaR); library(MASS); library(dplyr);
+
+wages <- Wage
+wages <- select(wages, -region, -sex)
+
+```
+
+The goal of this paper is to conduct exploratory data analysis, test three different models predicting wages in `Wages` dataset from `ISLR` library ^[[ISLR: Data for An Introduction to Statistical Learning with Applications in R](https://cran.r-project.org/web/packages/ISLR/index.html)] and choose the best model to predict top and worst earners. Some general comments:
+
+- For models building and testing I use `caret` package ^[[Caret package](ftp://cran.r-project.org/pub/R/web/packages/caret/caret.pdf)] .
+- For the model building and prediction wages continious variable will be converted into 3 categorical levels indicating top and bottom earners.
+- Because the dataset has been previously cleaned from NAs and properly formatted I have skiped the preprocessing part, but...
+- Region and Sex variables has been deleted - they do not differentiate the group. 
+
+## Exploratory Data Analysis
+
+In the first step let's explore if there are some highly correlated variables. Because most of the interesting variables are categorical I cannot count Pearson's correlations coefficients. Insted, I'm using `vcd` package to build contingency matrix and count Cramer's V's to quicky assess relations between variables. Variables have up to 5 levels and there is 3000 observations so the chi square statistics should be reliable.
+
+```{r echo = FALSE, fig.width=3.4}
+# Crames's function:
+vars <- colnames(wages[3:8])
+catcorrm <- function(vars, wages) sapply(vars, function(y) sapply(vars, function(x) assocstats(table(wages[,x], wages[,y]))$cramer))
+cramer <- catcorrm(vars, wages)
+
+# Correlation matrix for numeric variables:
+M <- cor(select(wages, year, age, logwage, wage))
+
+# Plot matrices:
+corrplot.mixed(cramer)
+corrplot.mixed(M)
+
+```
+
+Categorical variables are not highly correlated with each other and there will be no need to exlude them from the models. Beside obvious wages~logwages relation there is some interchangebility with age, and in education~jobclass pair.
+
+Now let's look closer what type of relation between dependent variables and wages we can find. After some trial and error I have chosen some graphs showing how do they relate to each other:
+
+```{r echo = FALSE, fig.width=7}
+ggplot(wages, aes(wage, fill = education)) +
+  geom_density(alpha = 0.6) +
+  ggtitle("Wage distributions among education levels") +
+  theme_gray()
+```
+
+```{r echo = FALSE, fig.width=7, fig.height=4}
+ggplot(data = wages, aes(x = age, y = wage)) +
+  geom_point(shape=1, aes(text = paste("Race:", race))) +
+  geom_smooth(method = "lm", se = FALSE, aes(colour = education, fill = education)) +
+  ggtitle("Wage vs age + linear trends based on education level") +
+  theme_gray()
+```
+
+```{r echo = FALSE, fig.width=7}
+ggplot(wages, aes(wage, fill = health_ins)) +
+  geom_density(alpha = 0.6) +
+  ggtitle("Wage distribution vs health insurance") +
+  theme_gray()
+```
+
+```{r echo = FALSE, fig.width=7}
+ggplot(aes(x = education, y = wage), data = wages) +
+    geom_boxplot(aes(fill = health_ins)) +
+    ggtitle("Wage levels by education and health insurance") +
+    theme_gray()
+```
+
+It looks promising. After EDA it seems that at least age, education and health isurance have some influance on the wage and can be used for our predictive models. I decided to exclude two variables logwage and maritil (highly imbalanced).
+
+As I mentioned at the begining, before modeling, let's convert wage continious variable into 3 categorical levels on the basis of the distribution:
+
+- low = bottom 30%
+- medium = <30%-70%>
+- high = top 30%
+
+```{r echo = FALSE, fig.width=3.4}
+cuts <- quantile(wages$wage, c(.30, .70))
+wages <- mutate(wages, wage_level = ifelse(wage < cuts[1], "low", ifelse(wage > cuts[2], "high", "medium")))
+
+ggplot(wages, aes(wage, fill = wage_level)) + geom_density() + theme_gray()
+ggplot(wages, aes(age, wage, color = wage_level)) + geom_point() + theme_gray()
+
+wages <- select(wages, -wage, -logwage, -maritl)
+
+
+```
+
+
+## Modeling
+
+To be able to verify the model I will split the provided dataset into train and test subsets with 8/2 proportion.
+
+```{r}
+inTrain <- createDataPartition(y = wages$wage_level, p = 0.8, list = FALSE)
+training <- wages[inTrain,]
+testing <- wages[-inTrain,]
+training <- tbl_df(training) #dplyr table for better performance
+testing <- tbl_df(testing) #dplyr table for better performance
+```
+
+### Building models
+
+After some experimentation, for this assignment I decided to compare three classification models with 10-fold cross validation and default parameters:
+
+- Decision Tree ^[[Wiki - decision tree](https://en.wikipedia.org/wiki/Decision_tree_learning)]
+- Random Forest ^[[Wiki - random forest](https://en.wikipedia.org/wiki/Random_forest)]
+- Naive Bayes ^[[Wiki - naive bayes](https://en.wikipedia.org/wiki/Naive_Bayes_classifier)]
+
+```{r message=FALSE, warning=FALSE}
+control <- trainControl(method="repeatedcv", number=10)
+
+fit_dt <- train(wage_level ~ ., data = training, method = "rpart", trControl = control)
+fit_rf <- train(wage_level ~ ., data = training, method = "rf", trControl = control)
+fit_nb <- train(wage_level ~ ., data = training, method = "nb", trControl = control)
+```
+
+```{r  echo = FALSE, fig.width=7}
+results <- resamples(list(DT=fit_dt, RF=fit_rf, NB=fit_nb))
+bwplot(results)
+```
+
+The accuracy level for all three models is not very high. The random forest with 0.57 and kappa 0.34 seems to be the best choice. Kappa indicates that the data seems unbalanced and there is high chance they will randomly classify to less common category. Let's look closer at estimates of predictors importance for random forest:
+
+```{r echo = FALSE, fig.width=3.4}
+importance <- varImp(fit_rf, scale=FALSE)
+plot(importance)
+plot(fit_rf)
+```
+
+The predictors importance confirms first intuitions from exploratory analysis. The most important variables are: age, lack of health insurance and higher education. Finally, let's test the `fit_rf` model on our test dataset.
+
+### Testing the best model
+
+Since the test dataset has not been used during the model building it can be treated as an unbiased estimate of model parameters. Let's predict wage levels with random forest model and check results with confusion matrix:
+
+```{r echo=FALSE}
+columns <- colnames(training)
+testing <- testing[columns]
+```
+
+```{r}
+prediction <- predict(fit_rf, testing)
+conf <- confusionMatrix(prediction, testing$wage_level)
+knitr::kable(head(conf$table))
+```
+
+- Accuracy stays at the similar level: 0.59
+- Sensitivity for each class varies between: 0.52 and 0.64 (true positives probability)
+- Specificity for each class varies between: 0.65 and 0.83 (true negatives probability)
+
+
